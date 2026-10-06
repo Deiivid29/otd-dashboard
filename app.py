@@ -1,18 +1,27 @@
 import datetime as dt
 import io
 
+import gspread
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+from google.oauth2.service_account import Credentials
 from plotly.subplots import make_subplots
 
 st.set_page_config(page_title="Dashboard OTD", page_icon="📦", layout="wide")
 
 NINGUNA = "(ninguna)"
 CATS_DEFECTO = {"racks", "shelves", "peripherals", "tray"}
+FIJAS = {"Date", "CW", "Year", "Total", "Vol", "Target", "Nota"}
 COLORES = ["#1f4e79", "#e07b39", "#2e6b2e", "#2a9bd1", "#8e44ad", "#c0392b"]
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
+          "https://www.googleapis.com/auth/drive"]
+F_PUB = "Datos publicados (equipo)"
+F_SP = "SharePoint (enlace)"
+F_UP = "Subir mi Excel (administrador)"
+F_EJ = "Datos de ejemplo"
 
 def secreto(nombre):
     try:
@@ -39,8 +48,8 @@ def datos_ejemplo():
     df["Vol"] = rng.integers(40000, 180000, len(df))
     df["Total"] = df[cats].mean(axis=1)
     df["Target"] = 0.95
-    df["Notas"] = ""
-    df.loc[30, "Notas"] = "shutdown week"
+    df["Nota"] = ""
+    df.loc[30, "Nota"] = "shutdown week"
     return df
 
 def a_fraccion(serie):
@@ -50,6 +59,7 @@ def a_fraccion(serie):
         s = s / 100
     return s
 
+# ---------- SharePoint (opcional, si algún día hay enlace público) ----------
 @st.cache_data(ttl=300, show_spinner="Descargando el archivo...")
 def descargar(url):
     if "download=1" not in url:
@@ -62,15 +72,91 @@ def descargar(url):
                          "¿Está compartido con 'Cualquier persona con el vínculo'?")
     return r.content
 
+# ---------- Datos publicados en Google Sheets ----------
+@st.cache_resource
+def libro_otd():
+    creds = Credentials.from_service_account_info(
+        dict(st.secrets["gcp_service_account"]), scopes=SCOPES)
+    return gspread.authorize(creds).open_by_key(st.secrets["otd_sheet_id"])
+
+def hoja(nombre):
+    lb = libro_otd()
+    try:
+        return lb.worksheet(nombre)
+    except gspread.WorksheetNotFound:
+        return lb.add_worksheet(nombre, rows=1000, cols=20)
+
+@st.cache_data(ttl=60, show_spinner="Cargando datos publicados...")
+def leer_publicados():
+    registros = hoja("datos").get_all_records()
+    publicado = hoja("meta").acell("B1").value
+    return pd.DataFrame(registros), publicado
+
+def tabla_publicable(dfull, categorias):
+    t = pd.DataFrame({"Date": dfull["fecha"].dt.strftime("%Y-%m-%d"),
+                      "CW": dfull["sem"], "Year": dfull["año"], "Total": dfull["total"]})
+    for c in categorias:
+        t[c] = dfull[c]
+    t["Vol"] = dfull["vol"]
+    t["Target"] = dfull["target"]
+    t["Nota"] = dfull["nota"]
+    return t
+
+def publicar(t):
+    valores = [list(t.columns)] + t.astype(object).where(t.notna(), "").values.tolist()
+    ws = hoja("datos")
+    ws.clear()
+    ws.resize(rows=len(valores) + 20, cols=len(valores[0]) + 2)
+    ws.update(values=valores, range_name="A1", value_input_option="RAW")
+    ahora = pd.Timestamp.now(tz="America/Mexico_City").strftime("%d/%m/%Y %H:%M")
+    hoja("meta").update(values=[["publicado", ahora]], range_name="A1", value_input_option="RAW")
+    leer_publicados.clear()
+
 st.title("📦 Dashboard OTD (on time delivery)")
 
 url_excel = secreto("excel_url")
-opciones_fuente = (["SharePoint (enlace)"] if url_excel else []) + ["Subir mi Excel", "Datos de ejemplo"]
+sheets_cfg = bool(secreto("otd_sheet_id")) and bool(secreto("gcp_service_account"))
+opciones_fuente = []
+if sheets_cfg:
+    opciones_fuente.append(F_PUB)
+if url_excel:
+    opciones_fuente.append(F_SP)
+opciones_fuente += [F_UP, F_EJ]
 fuente = st.radio("Fuente de datos", opciones_fuente, horizontal=True)
 
-if fuente == "Datos de ejemplo":
+if fuente == F_EJ:
     df_raw = datos_ejemplo()
-elif fuente == "Subir mi Excel":
+elif fuente == F_PUB:
+    try:
+        df_raw, publicado = leer_publicados()
+    except Exception as e:
+        st.error(f"No pude leer los datos publicados: {e}")
+        st.stop()
+    if df_raw.empty:
+        st.info("Todavía no hay datos publicados. Pide al administrador que publique el Excel.")
+        st.stop()
+    st.caption(f"Datos publicados el {publicado or 'fecha desconocida'}")
+    if st.button("🔄 Actualizar datos ahora"):
+        leer_publicados.clear()
+        st.rerun()
+elif fuente == F_SP:
+    try:
+        contenido = descargar(url_excel)
+    except Exception as e:
+        st.error(f"No pude descargar el archivo de SharePoint: {e}")
+        st.stop()
+    xls = pd.ExcelFile(io.BytesIO(contenido))
+    hoja_fija = secreto("excel_hoja")
+    nombre_hoja = hoja_fija if hoja_fija in xls.sheet_names else st.selectbox("Hoja", xls.sheet_names)
+    df_raw = xls.parse(nombre_hoja)
+    if st.button("🔄 Actualizar datos ahora"):
+        descargar.clear()
+        st.rerun()
+else:
+    admin = secreto("admin_password")
+    if admin and st.text_input("Contraseña de administrador", type="password", key="adm") != admin:
+        st.info("Escribe la contraseña de administrador para subir y publicar datos.")
+        st.stop()
     archivo = st.file_uploader("Sube tu archivo (.xlsx o .csv)", type=["xlsx", "csv"])
     if archivo is None:
         st.info("Sube tu archivo para ver el dashboard. La tabla debe empezar en la celda A1 de su hoja.")
@@ -79,21 +165,8 @@ elif fuente == "Subir mi Excel":
         df_raw = pd.read_csv(archivo)
     else:
         xls = pd.ExcelFile(archivo)
-        hoja = st.selectbox("Hoja", xls.sheet_names)
-        df_raw = xls.parse(hoja)
-else:
-    try:
-        contenido = descargar(url_excel)
-    except Exception as e:
-        st.error(f"No pude descargar el archivo de SharePoint: {e}")
-        st.stop()
-    xls = pd.ExcelFile(io.BytesIO(contenido))
-    hoja_fija = secreto("excel_hoja")
-    hoja = hoja_fija if hoja_fija in xls.sheet_names else st.selectbox("Hoja", xls.sheet_names)
-    df_raw = xls.parse(hoja)
-    if st.button("🔄 Actualizar datos ahora"):
-        descargar.clear()
-        st.rerun()
+        nombre_hoja = st.selectbox("Hoja", xls.sheet_names)
+        df_raw = xls.parse(nombre_hoja)
 
 with st.expander("🔍 Ver cómo leí tu archivo"):
     st.write(f"{len(df_raw)} filas y {len(df_raw.columns)} columnas")
@@ -118,7 +191,10 @@ with st.sidebar:
     c_anio = st.selectbox("Año", opc, index=pick({"year", "año", "anio"}, True))
     c_target = st.selectbox("Meta (target)", opc, index=pick({"target", "meta"}, True))
     c_nota = st.selectbox("Notas", opc, index=pick({"column1", "notas", "nota", "notes", "comentarios"}, True))
-    defecto_cats = [c for c in cols if str(c).strip().lower() in CATS_DEFECTO]
+    if fuente == F_PUB:
+        defecto_cats = [c for c in cols if c not in FIJAS]
+    else:
+        defecto_cats = [c for c in cols if str(c).strip().lower() in CATS_DEFECTO]
     categorias = st.multiselect("Categorías (columnas de OTD)", cols, default=defecto_cats)
     meta_fija = st.number_input("Meta fija (%) si no hay columna de meta", value=95.0, step=0.5) / 100
     st.subheader("Opciones")
@@ -147,6 +223,15 @@ if d.empty:
 d["año"] = d["año"].astype(int)
 d["sem"] = d["sem"].astype(int)
 d = d.sort_values(["año", "sem"]).reset_index(drop=True)
+
+# ---------- Publicar (solo administrador) ----------
+if fuente == F_UP and sheets_cfg:
+    if st.button("📤 Publicar estos datos para el equipo"):
+        try:
+            publicar(tabla_publicable(d, categorias))
+            st.success(f"Publicado: {len(d)} semanas. El equipo ya las ve en '{F_PUB}'.")
+        except Exception as e:
+            st.error(f"No pude publicar: {e}")
 
 # ---------- Semana en curso ----------
 try:
