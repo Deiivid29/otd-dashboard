@@ -1,8 +1,10 @@
+import datetime as dt
 import io
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 from plotly.subplots import make_subplots
 
@@ -12,14 +14,14 @@ NINGUNA = "(ninguna)"
 CATS_DEFECTO = {"racks", "shelves", "peripherals", "tray"}
 COLORES = ["#1f4e79", "#e07b39", "#2e6b2e", "#2a9bd1", "#8e44ad", "#c0392b"]
 
-# ---------- Contraseña opcional ----------
-def clave_configurada():
+def secreto(nombre):
     try:
-        return st.secrets.get("password")
+        return st.secrets.get(nombre)
     except Exception:
         return None
 
-clave = clave_configurada()
+# ---------- Contraseña opcional ----------
+clave = secreto("password")
 if clave:
     if st.text_input("Contraseña", type="password") != clave:
         st.stop()
@@ -42,17 +44,33 @@ def datos_ejemplo():
     return df
 
 def a_fraccion(serie):
-    s = pd.to_numeric(serie, errors="coerce")
+    texto = serie.astype(str).str.replace("%", "", regex=False)
+    s = pd.to_numeric(texto.str.replace(",", ".", regex=False).str.strip(), errors="coerce")
     if s.notna().any() and s.median() > 1.5:   # vienen como 98.5 en vez de 0.985
         s = s / 100
     return s
 
+@st.cache_data(ttl=300, show_spinner="Descargando el archivo...")
+def descargar(url):
+    if "download=1" not in url:
+        url = url + ("&" if "?" in url else "?") + "download=1"
+    r = requests.get(url, timeout=30, allow_redirects=True,
+                     headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    if not r.content.startswith(b"PK"):
+        raise ValueError("El enlace no devolvió un archivo Excel. "
+                         "¿Está compartido con 'Cualquier persona con el vínculo'?")
+    return r.content
+
 st.title("📦 Dashboard OTD (on time delivery)")
 
-fuente = st.radio("Fuente de datos", ["Datos de ejemplo", "Subir mi Excel"], horizontal=True)
+url_excel = secreto("excel_url")
+opciones_fuente = (["SharePoint (enlace)"] if url_excel else []) + ["Subir mi Excel", "Datos de ejemplo"]
+fuente = st.radio("Fuente de datos", opciones_fuente, horizontal=True)
+
 if fuente == "Datos de ejemplo":
     df_raw = datos_ejemplo()
-else:
+elif fuente == "Subir mi Excel":
     archivo = st.file_uploader("Sube tu archivo (.xlsx o .csv)", type=["xlsx", "csv"])
     if archivo is None:
         st.info("Sube tu archivo para ver el dashboard. La tabla debe empezar en la celda A1 de su hoja.")
@@ -63,6 +81,23 @@ else:
         xls = pd.ExcelFile(archivo)
         hoja = st.selectbox("Hoja", xls.sheet_names)
         df_raw = xls.parse(hoja)
+else:
+    try:
+        contenido = descargar(url_excel)
+    except Exception as e:
+        st.error(f"No pude descargar el archivo de SharePoint: {e}")
+        st.stop()
+    xls = pd.ExcelFile(io.BytesIO(contenido))
+    hoja_fija = secreto("excel_hoja")
+    hoja = hoja_fija if hoja_fija in xls.sheet_names else st.selectbox("Hoja", xls.sheet_names)
+    df_raw = xls.parse(hoja)
+    if st.button("🔄 Actualizar datos ahora"):
+        descargar.clear()
+        st.rerun()
+
+with st.expander("🔍 Ver cómo leí tu archivo"):
+    st.write(f"{len(df_raw)} filas y {len(df_raw.columns)} columnas")
+    st.dataframe(df_raw.head(10))
 
 cols = list(df_raw.columns)
 opc = [NINGUNA] + cols
@@ -113,6 +148,23 @@ d["año"] = d["año"].astype(int)
 d["sem"] = d["sem"].astype(int)
 d = d.sort_values(["año", "sem"]).reset_index(drop=True)
 
+# ---------- Semana en curso ----------
+try:
+    iso = pd.Timestamp.now(tz="America/Mexico_City").isocalendar()
+    sem_hoy = int(iso[1])
+    lunes_hoy = dt.date.fromisocalendar(int(iso[0]), sem_hoy, 1)
+    ult_fila = d.iloc[-1]
+    lunes_ult = dt.date.fromisocalendar(int(ult_fila["año"]), int(ult_fila["sem"]), 1)
+    atraso = (lunes_hoy - lunes_ult).days // 7
+    resumen = (f"Semana en curso: CW{sem_hoy} · última semana con datos: "
+               f"CW{int(ult_fila['sem'])} ({int(ult_fila['año'])})")
+    if atraso <= 1:
+        st.success("✅ Datos al día. " + resumen)
+    else:
+        st.warning(f"⚠️ Faltan datos ({atraso} semanas de atraso). " + resumen)
+except Exception:
+    pass
+
 # ---------- Filtros ----------
 años = sorted(d["año"].unique())
 sel_años = st.multiselect("Año", años, default=años)
@@ -150,11 +202,14 @@ def prom(serie):
 # ---------- Tarjetas ----------
 meta = float(d["target"].iloc[-1])
 otd = prom(d["total"])
-k1, k2, k3, k4 = st.columns(4)
+ult = d.iloc[-1]
+k1, k2, k3, k4, k5 = st.columns(5)
 k1.metric("OTD promedio", f"{otd:.2%}", f"{(otd - meta) * 100:+.1f} pts vs meta")
 k2.metric("Volumen total", f"{d['vol'].sum():,.0f}" if d["vol"].notna().any() else "—")
 k3.metric("Meta", f"{meta:.0%}")
 k4.metric("Periodos bajo la meta", f"{int((d['total'] < d['target']).sum())} de {len(d)}")
+k5.metric(f"Última ({ult['x']})", f"{ult['total']:.1%}",
+          f"{(ult['total'] - ult['target']) * 100:+.1f} pts vs meta")
 
 # ---------- Gráfico 1: OTD total, volumen y meta ----------
 fig = make_subplots(specs=[[{"secondary_y": True}]])
