@@ -118,7 +118,7 @@ def publicar(t):
 
 if LOGO:
     c_logo, c_tit = st.columns([1, 8], vertical_alignment="center")
-    c_logo.image(LOGO, width=90)
+    c_logo.image(LOGO, width=150)
     c_tit.title('Dashboard OTD "Axiom" RES GDL')
 else:
     st.title('Dashboard OTD "Axiom" RES GDL')
