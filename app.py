@@ -10,7 +10,11 @@ import streamlit as st
 from google.oauth2.service_account import Credentials
 from plotly.subplots import make_subplots
 
-st.set_page_config(page_title="Dashboard OTD", page_icon="📦", layout="wide")
+import os
+
+LOGO = "logo.png" if os.path.exists("logo.png") else None
+st.set_page_config(page_title='Dashboard OTD "Axiom" RES GDL', page_icon=LOGO or "📦", layout="wide")
+
 
 NINGUNA = "(ninguna)"
 CATS_DEFECTO = {"racks", "shelves", "peripherals", "tray"}
@@ -112,7 +116,12 @@ def publicar(t):
     hoja("meta").update(values=[["publicado", ahora]], range_name="A1", value_input_option="RAW")
     leer_publicados.clear()
 
-st.title("📦 Dashboard OTD (on time delivery)")
+if LOGO:
+    c_logo, c_tit = st.columns([1, 8], vertical_alignment="center")
+    c_logo.image(LOGO, width=90)
+    c_tit.title('Dashboard OTD "Axiom" RES GDL')
+else:
+    st.title('Dashboard OTD "Axiom" RES GDL')
 
 url_excel = secreto("excel_url")
 sheets_cfg = bool(secreto("otd_sheet_id")) and bool(secreto("gcp_service_account"))
