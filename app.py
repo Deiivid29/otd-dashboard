@@ -92,7 +92,7 @@ def hoja(nombre):
 
 @st.cache_data(ttl=60, show_spinner="Cargando datos publicados...")
 def leer_publicados():
-        registros = hoja("datos").get_all_records(value_render_option="UNFORMATTED_VALUE")
+    registros = hoja("datos").get_all_records(value_render_option="UNFORMATTED_VALUE")
     publicado = hoja("meta").acell("B1").value
     return pd.DataFrame(registros), publicado
 
